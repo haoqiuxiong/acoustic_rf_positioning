@@ -1,0 +1,652 @@
+#!/usr/bin/env python3
+#
+# Copyright 2025 Ettus Research, a National Instruments Brand
+#
+# SPDX-License-Identifier: GPL-3.0-or-later
+"""Example to transmit waveforms using UHD python API.
+
+This example transmits samples of dynamically generated, common waveforms,
+supporting sine, square, constant and ramp pattern. It's intended for use with
+a single device and supports transmitting the same waveform on multiple
+channels. The example implements two main operation modes that may not be
+supported by all USRPs devices and FPGA bitfile flavors.
+
+1. Host based: This mode uses the MultiUSRP API
+<https://files.ettus.com/manual/page_coding.html#coding_api_hilevel> to stream
+a continuous tone waveform to the USRP and transmit it on the fly. This mode
+is supported by all USRPs and subjects the host's ability (which depends on CPU
+speed, network interface speed, CPU thread interruptions) to stream samples as
+fast as the USRP is transmitting them.
+
+2. RFNoC Replay: This mode uses advanced API functions to buffer a waveform
+in the USRP's onboard DRAM before transmitting it. It utilizes capabilities of
+RFNoC (RF Network-on-Chip) <https://www.ettus.com/sdr-software/rfnoc/> together
+to create a dynamic RFNoC graph connecting multiple RFNoC blocks stream a
+waveform pattern from the host to DRAM and transmit the buffered waveform
+pattern from DRAM. This mode requires FPGA bitfiles that contain the RFNoC
+Replay Block and is not supported on all USRPs.
+
+Example usage:
+tx_waveforms.py --args addr=192.168.10.2 --freq 2.4e9 --rate 1e6 --duration 10
+                --channels 0 --wave-freq 1e4 --wave-ampl 0.3 --dram
+"""
+
+import argparse
+import json
+import logging
+import socket
+import sys
+import threading
+import time
+from datetime import datetime
+from pathlib import Path
+
+import numpy as np
+import runtime_storage
+import uhd
+import yaml
+import zmq
+
+# from uhd.usrp import dram_utils
+
+
+REF_CLIENT_ID = "ref"
+HOSTNAME_RAW = socket.gethostname()
+HOSTNAME = HOSTNAME_RAW[4:] if len(HOSTNAME_RAW) > 4 else HOSTNAME_RAW
+RUNTIME_OUTPUT_DIR = None
+log_file_handler = None
+
+
+class LogFormatter(logging.Formatter):
+    """Custom log formatter that prints timestamps with fractional seconds."""
+
+    @staticmethod
+    def pp_now():
+        now = datetime.now()
+        return "{:%H:%M}:{:05.2f}".format(now, now.second + now.microsecond / 1e6)
+
+    def formatTime(self, record, datefmt=None):
+        converter = self.converter(record.created)
+        if datefmt:
+            formatted_date = converter.strftime(datefmt)
+        else:
+            formatted_date = LogFormatter.pp_now()
+        return formatted_date
+
+
+class ColoredFormatter(LogFormatter):
+    """Console formatter with ANSI colors per level."""
+
+    COLORS = {
+        logging.DEBUG: "\033[36m",
+        logging.INFO: "\033[32m",
+        logging.WARNING: "\033[33m",
+        logging.ERROR: "\033[31m",
+        logging.CRITICAL: "\033[35m",
+    }
+    RESET = "\033[0m"
+
+    def format(self, record):
+        color = self.COLORS.get(record.levelno, "")
+        reset = self.RESET if color else ""
+        record.levelname = f"{color}{record.levelname}{reset}"
+        return super().format(record)
+
+
+logger = logging.getLogger(__name__)
+logger.setLevel(logging.DEBUG)
+logger.propagate = False
+
+formatter = LogFormatter(
+    fmt="[%(asctime)s] [%(levelname)s] (%(threadName)-10s) %(message)s"
+)
+
+if not logger.handlers:
+    console = logging.StreamHandler()
+    console.setFormatter(ColoredFormatter(fmt=formatter._fmt))
+    logger.addHandler(console)
+
+
+def now_ms() -> int:
+    return int(time.time() * 1000)
+
+
+def jdump(obj):
+    return json.dumps(obj, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+
+
+def jload(payload):
+    return json.loads(payload.decode("utf-8"))
+
+
+def configure_file_logging(output_dir):
+    global RUNTIME_OUTPUT_DIR, log_file_handler
+
+    RUNTIME_OUTPUT_DIR = Path(output_dir)
+    RUNTIME_OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+
+    if log_file_handler is not None:
+        logger.removeHandler(log_file_handler)
+        log_file_handler.close()
+
+    log_file_handler = logging.FileHandler(
+        RUNTIME_OUTPUT_DIR / f"{Path(__file__).stem}.log",
+        mode="w",
+    )
+    log_file_handler.setFormatter(formatter)
+    logger.addHandler(log_file_handler)
+
+
+def load_experiment_settings(path: str):
+    settings_path = Path(path).expanduser().resolve()
+    with open(settings_path, "r", encoding="utf-8") as handle:
+        return yaml.safe_load(handle) or {}
+
+
+def resolve_orchestrator_connect(args):
+    if args.orchestrator_connect:
+        return args.orchestrator_connect
+    if not args.config_file:
+        return None
+
+    settings = load_experiment_settings(args.config_file)
+    server_settings = settings.get("server") or {}
+    host = server_settings.get("host")
+    port = server_settings.get("orchestrator_port", 5555)
+    if not host:
+        raise ValueError(
+            "Missing server.host in experiment settings; "
+            "set server.host or pass --orchestrator-connect."
+        )
+    if "://" in str(host):
+        return str(host)
+    return f"tcp://{host}:{port}"
+
+
+def ref_status_client(
+    connect: str,
+    client_id: str,
+    started_event: threading.Event,
+    active_event: threading.Event,
+    shutdown_event: threading.Event,
+    error_state: dict,
+) -> None:
+    ctx = zmq.Context()
+    sock = ctx.socket(zmq.DEALER)
+    sock.linger = 0
+    sock.setsockopt(zmq.IDENTITY, client_id.encode("utf-8"))
+    sock.connect(connect)
+
+    poller = zmq.Poller()
+    poller.register(sock, zmq.POLLIN)
+
+    hello_sent = False
+    shutdown_notice_sent = False
+
+    try:
+        while not shutdown_event.is_set():
+            if started_event.is_set() and not hello_sent:
+                sock.send(
+                    jdump(
+                        {
+                            "type": "HELLO",
+                            "id": client_id,
+                            "service": "run-ref",
+                            "status": "started",
+                            "ts": now_ms(),
+                        }
+                    )
+                )
+                hello_sent = True
+                logger.info("[%s] announced readiness to %s", client_id, connect)
+
+            events = dict(poller.poll(250))
+            if sock in events:
+                msg = jload(sock.recv())
+                mtype = msg.get("type")
+                ping_id = msg.get("ping_id")
+
+                if mtype == "PING":
+                    if active_event.is_set():
+                        sock.send(
+                            jdump(
+                                {
+                                    "type": "PONG",
+                                    "id": client_id,
+                                    "ping_id": ping_id,
+                                    "ts": now_ms(),
+                                }
+                            )
+                        )
+                    else:
+                        sock.send(
+                            jdump(
+                                {
+                                    "type": "ERROR",
+                                    "id": client_id,
+                                    "ping_id": ping_id,
+                                    "error": error_state.get("message") or "run-ref inactive",
+                                    "ts": now_ms(),
+                                }
+                            )
+                        )
+                else:
+                    sock.send(
+                        jdump(
+                            {
+                                "type": "ERROR",
+                                "id": client_id,
+                                "error": f"Unexpected message type: {mtype}",
+                                "ts": now_ms(),
+                            }
+                        )
+                    )
+
+            if hello_sent and not active_event.is_set() and error_state.get("message") and not shutdown_notice_sent:
+                sock.send(
+                    jdump(
+                        {
+                            "type": "ERROR",
+                            "id": client_id,
+                            "error": error_state["message"],
+                            "ts": now_ms(),
+                        }
+                    )
+                )
+                shutdown_notice_sent = True
+    finally:
+        sock.close()
+        ctx.term()
+
+
+def parse_args():
+    """Parses the command line arguments.
+
+    Configuring the transmission, such as frequency, rate, duration,
+    gain, waveform type, and whether to use DRAM for streaming.
+    """
+    parser = argparse.ArgumentParser(
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        description=__doc__,
+    )
+    parser.add_argument(
+        "-a",
+        "--args",
+        type=str,
+        default="",
+        help="""specifies the USRP device arguments, which holds
+        multiple key value pairs separated by commas
+        (e.g., addr=192.168.40.2,type=x300) [default = ""].""",
+    )
+    parser.add_argument(
+        "-w",
+        "--waveform",
+        choices=["sine", "square", "const", "ramp"],
+        type=str,
+        default="sine",
+        help="specifies the waveform type [Default = sine]",
+    )
+    parser.add_argument(
+        "-f",
+        "--freq",
+        type=float,
+        required=True,
+        help="specifies the RF center frequency in Hz (input is required)",
+    )
+    parser.add_argument(
+        "-r",
+        "--rate",
+        type=float,
+        default=1e6,
+        help="specifies the sample rate in samples/seconds of the waveform generated at the host [Default = 1e6]",
+    )
+    parser.add_argument(
+        "-d",
+        "--duration",
+        type=float,
+        default=5.0,
+        help="""specifies the transmit duration in seconds.
+        If duration = -1 and --dram argument is used, the waveform pattern is repeated continuously until stopped.
+        If duration > 0, the transmission stops after the configured duration.
+        [Default = 0.5]""",
+    )
+    parser.add_argument(
+        "-c",
+        "--channels",
+        nargs="+",
+        type=int,
+        default=0,
+        help='specifies the channels to use (e.g., "0", "1", "0 1", etc) [Default = 0]',
+    )
+    parser.add_argument(
+        "-g",
+        "--gain",
+        type=int,
+        default=10,
+        help="specifies the gain for the RF chain in dB scale [Default = 10]",
+    )
+    parser.add_argument(
+        "--wave-freq",
+        type=float,
+        default=0,
+        help="specifies the waveform frequency in Hz [Default = 0]",
+    )
+    parser.add_argument(
+        "--wave-ampl",
+        type=float,
+        default=0.3,
+        help="specifies the waveform amplitude in the range [0 to 0.7] [Default = 0.3]",
+    )
+    parser.add_argument(
+        "--tx-delay",
+        type=float,
+        default=0.5,
+        help="specifies the delay in seconds (relative to when the command is executed) before simultaneously starting transmission on all channels [Default = 0.5]",
+    )
+    parser.add_argument(
+        "--dram",
+        action="store_true",
+        help="specifies the operation mode (Host based or RFNoC Replay). If argument --dram is specified, the program will attempt to use RFNoC Replay mode, else Host Based",
+    )
+    parser.add_argument(
+        "--config-file",
+        type=str,
+        default=None,
+        help="Optional experiment-settings.yaml used to derive the orchestrator endpoint.",
+    )
+    parser.add_argument(
+        "--orchestrator-connect",
+        type=str,
+        default=None,
+        help="Optional ZMQ endpoint of zmq_orchestrator.py, for example tcp://server:5555.",
+    )
+    parser.add_argument(
+        "--orchestrator-id",
+        type=str,
+        default=REF_CLIENT_ID,
+        help=f"Identity used for the orchestrator readiness link [default: {REF_CLIENT_ID}]",
+    )
+    return parser.parse_args()
+
+
+def multi_usrp_tx(args, on_tx_started=None):
+    """multi_usrp based TX example.
+
+    The function sets up and transmits a waveform using
+    the uhd.usrp.MultiUSRP class. It configures the USRP device, generates a
+    continuous tone waveform, streams it to the USRP and transmits it.
+    """
+    usrp = uhd.usrp.MultiUSRP("enable_user_regs, mode_n=integer")
+
+    # Zet de referentie op external
+    usrp.set_clock_source("external")  # 'internal', 'external', 'gpsdo'
+
+    # Optioneel: ook de time source
+    usrp.set_time_source("external")  # 'internal', 'external', 'gpsdo'
+
+    if args.wave_freq == 0.0:
+        desired_size = 1e6  # Default size of the transmission buffer (or burst)
+    else:
+        desired_size = 10 * np.floor(args.rate / args.wave_freq)
+
+    tx_start_time = None  # Start transmission immediately
+    # Delay transmission start. This will allow SW to apply all
+    # configurations and start transmission on all channels simultaneously.
+    # If tx_delay is too small, tx_start_time may be in the past by the time
+    # all configurations are applied and late command errors being reported.
+    tx_start_time = usrp.get_time_now() + args.tx_delay
+    logger.info("Generating waveform...")
+    data = uhd.dsp.signals.get_continuous_tone(
+        args.rate,
+        args.wave_freq,
+        args.wave_ampl,
+        desired_size=desired_size,
+        max_size=(args.duration * args.rate),
+        # ,
+        #        waveform=args.waveform,
+    )
+    logger.info(
+        f"Starting to stream waveform at the rate of {args.rate} samples/sec for the duration of {args.duration} seconds..."
+    )
+    if on_tx_started is not None:
+        on_tx_started()
+    usrp.send_waveform(
+        data,
+        args.duration,
+        args.freq,
+        args.rate,
+        args.channels,
+        args.gain,
+        tx_start_time,
+    )
+    logger.info("Transmission complete.")
+
+
+def rfnoc_dram_tx(args, on_tx_started=None):
+    """rfnoc_graph + replay-block based TX example.
+
+    Refer Replay Block usage here <https://kb.ettus.com/Using_the_RFNoC_Replay_Block>.
+    The function uses the RFNoC (RF Network-on-Chip) framework to transmit waveforms
+    via DRAM. It initializes a graph, configures radio channels, sets rates and
+    frequencies, uploads waveform data to DRAM, and starts streaming.
+    """
+    # Init graph
+    graph = uhd.rfnoc.RfnocGraph(args.args)
+    if graph.get_num_mboards() > 1:
+        logger.error(
+            "ERROR: This example only supports DRAM streaming on a single motherboard."
+        )
+        return
+    # Init radios and replay block
+    available_radio_chans = [
+        (radio_block_id, chan)
+        for radio_block_id in graph.find_blocks("Radio")
+        for chan in range(graph.get_block(radio_block_id).get_num_input_ports())
+    ]
+    radio_chans = [available_radio_chans[x] for x in args.channels]
+    logger.info(
+        "Transmitting on radio channels: %s",
+        ", ".join(f"{r}:{c}" for r, c in radio_chans),
+    )
+    dram = dram_utils.DramTransmitter(graph, radio_chans, cpu_format="fc32")
+    replay = dram.replay_blocks[0]
+    logger.info("Using replay block: %s", replay.get_unique_id())
+    # Separate loops for setting rate and frequency to minimize timed cmd queue
+    for (radio, radio_chan), duc_info in zip(
+        dram.radio_chan_pairs, dram.duc_chan_pairs
+    ):
+        radio.set_tx_gain(args.gain, radio_chan)
+        if duc_info:
+            duc, duc_chan = duc_info
+            duc.set_output_rate(args.rate, duc_chan)
+        else:
+            radio.set_rate(args.rate)
+
+    if len(dram.radio_chan_pairs) > 1:
+        # Use timed tuning for more than one channel to produce consistent
+        # phase offsets between channels.
+        cmd_time_offset = 0.1
+        cmd_time = dram.radio_chan_pairs[0][0].get_time_now() + cmd_time_offset
+        for radio, radio_chan in dram.radio_chan_pairs:
+            radio.set_command_time(cmd_time, radio_chan)
+            radio.set_tx_frequency(args.freq, radio_chan)
+        for radio, radio_chan in dram.radio_chan_pairs:
+            radio.clear_command_time(radio_chan)
+        # Enough time for tune time to expire
+        time.sleep(cmd_time_offset)
+    else:
+        for radio, radio_chan in dram.radio_chan_pairs:
+            radio.set_tx_frequency(args.freq, radio_chan)
+
+    # Overwrite default memory regions to maximize available memory
+    mem_regions = [(0, replay.get_mem_size()) for _ in args.channels]
+    dram.mem_regions = mem_regions
+    # Generate waveform
+    data = uhd.dsp.signals.get_continuous_tone(
+        args.rate,
+        args.wave_freq,
+        args.wave_ampl,
+        desired_size=args.duration * args.rate,
+        max_size=dram.replay_blocks[0].get_mem_size(),
+        waveform=args.waveform,
+    )
+    if (
+        args.duration > 0
+        and len(radio_chans) == 1
+        and dram.replay_blocks[0].get_mem_size() / 4 < args.duration * args.rate
+    ):
+        if len(data) < args.duration * args.rate:
+            # If we are using this API, then we need to upload the entire waveform.
+            # We can't make use of looping over the same memory region over and
+            # over again.
+            data = np.tile(data, int(args.duration * args.rate // len(data)) + 1)
+            data = data[: args.duration * args.rate]
+        # This if-branch is completely redundant, but we keep it here as this is
+        # an example and we want to showcase different ways of using the
+        # DramTransmitter class.
+        logger.info(
+            f"Uploading waveform data ({data.nbytes/(1024**2):.2f} MiB) "
+            f"Starting to stream waveform at the rate of {args.rate} samples/sec for the duration of {args.duration} seconds..."
+        )
+        tx_md = uhd.types.TXMetadata()
+        # do not use time spec if tx_delay is 0
+        if args.tx_delay == 0:
+            tx_md.has_time_spec = False
+        else:
+            # In this case the tx_start_time needs to be sufficiently in the future
+            # to also allow uploading of the data to the DRAM.
+            tx_md.has_time_spec = True
+            tx_md.time_spec = dram.radio_chan_pairs[0][0].get_time_now() + args.tx_delay
+        # These flags actually don't do anything; but if this was a regular TX
+        # streamer object, that's what we would write here.
+        tx_md.start_of_burst = True
+        tx_md.end_of_burst = True
+        # Upload and send at time specified by tx_start_time
+        if on_tx_started is not None:
+            on_tx_started()
+        dram.send(data, tx_md, 1.0)
+    else:
+        # Upload
+        logger.info("Uploading waveform data (%.2f MiB)...", data.nbytes / (1024**2))
+        dram.upload(data)
+        # Start streaming
+        stream_mode = (
+            uhd.types.StreamMode.start_cont
+            if args.duration <= 0
+            else uhd.types.StreamMode.num_done
+        )
+        stream_cmd = uhd.types.StreamCMD(stream_mode)
+        if args.duration > 0:
+            stream_cmd.num_samps = int(args.duration * args.rate)
+        if args.tx_delay == 0:
+            stream_cmd.stream_now = True
+        else:
+            stream_cmd.stream_now = False
+            stream_cmd.time_spec = (
+                dram.radio_chan_pairs[0][0].get_time_now() + args.tx_delay
+            )
+        logger.info(
+            f"Starting to stream waveform at the rate of {args.rate} samples/sec for the duration of {args.duration} seconds..."
+        )
+        if on_tx_started is not None:
+            on_tx_started()
+        dram.issue_stream_cmd(stream_cmd)
+    if args.duration > 0:
+        logger.info("Waiting for transmission to complete...")
+        # Sleep time allows for 1s of extra time for the transmission to complete
+        time.sleep(args.duration + 1.0 + args.tx_delay)
+        async_timeout = time.monotonic() + 5.0
+        async_md = None
+        while time.monotonic() < async_timeout:
+            async_md = dram.recv_async_msg(0.5)
+            if (
+                async_md
+                and async_md.event_code == uhd.types.TXMetadataEventCode.burst_ack
+            ):
+                break
+            if async_md:
+                logger.warning("Caught TX event code: %s", async_md.event_code)
+                async_md = None
+        if not async_md:
+            logger.error("Unable to receive ACK after burst!")
+        logger.info("Transmission complete.")
+    else:
+        logger.info("Transmitting (Hit Ctrl-C to stop)...")
+        try:
+            while True:
+                time.sleep(1.0)
+        except KeyboardInterrupt:
+            logger.info("Terminating streaming.")
+        stream_cmd = uhd.types.StreamCMD(uhd.types.StreamMode.stop_cont)
+        stream_cmd.stream_now = True
+        dram.issue_stream_cmd(stream_cmd)
+        time.sleep(args.tx_delay)
+
+
+def main():
+    """Transmit samples based on the input arguments."""
+    args = parse_args()
+    if not isinstance(args.channels, list):
+        args.channels = [args.channels]
+
+    try:
+        runtime_config = runtime_storage.resolve_runtime_output_dir(
+            args.config_file,
+            HOSTNAME,
+        )
+        configure_file_logging(runtime_config["host_output_dir"])
+        logger.info("Invocation args: %s", " ".join(sys.argv))
+        logger.info(
+            "Loaded experiment settings from %s",
+            runtime_config["settings_path"],
+        )
+        logger.info("Runtime output directory: %s", RUNTIME_OUTPUT_DIR)
+    except Exception as exc:
+        logger.error("Unable to initialize runtime storage: %s", exc)
+        return
+
+    orchestrator_connect = resolve_orchestrator_connect(args)
+    started_event = threading.Event()
+    active_event = threading.Event()
+    shutdown_event = threading.Event()
+    error_state = {"message": ""}
+    monitor_thread = None
+
+    if orchestrator_connect:
+        monitor_thread = threading.Thread(
+            target=ref_status_client,
+            args=(
+                orchestrator_connect,
+                args.orchestrator_id,
+                started_event,
+                active_event,
+                shutdown_event,
+                error_state,
+            ),
+            daemon=True,
+            name="ref_status_client",
+        )
+        monitor_thread.start()
+
+    def on_tx_started():
+        active_event.set()
+        started_event.set()
+
+    try:
+        if args.dram:
+            rfnoc_dram_tx(args, on_tx_started=on_tx_started)
+        else:
+            multi_usrp_tx(args, on_tx_started=on_tx_started)
+    except Exception as exc:
+        error_state["message"] = str(exc)
+        logger.exception("run-ref failed")
+        raise
+    finally:
+        active_event.clear()
+        shutdown_event.set()
+        if monitor_thread is not None:
+            monitor_thread.join(timeout=2.0)
+
+
+if __name__ == "__main__":
+    main()

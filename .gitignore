@@ -1,0 +1,144 @@
+acoustic/DATA/check.py
+acoustic/DATA/Measured_RIRs_4.58_2.68_0.2_20260310_150530.csv
+acoustic/DATA/Measured_RIRs_4.58_2.68_0.2_20260310_150614.csv
+acoustic/DATA/Measured_RIRs_4.58_2.68_0.2_20260310_150838.csv
+acoustic/DATA/Measured_RIRs_4.58_2.68_0.2_20260310_151103.csv
+acoustic/DATA/Measured_RIRs_4.58_2.68_0.2_20260310_152527.csv
+acoustic/DATA/Measured_RIRs_4.58_2.68_0.2_20260310_152555.csv
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.so
+.Python
+build/
+dist/
+.eggs/
+*.egg-info/
+pip-wheel-metadata/
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+.python-version
+
+# Testing, linting, and coverage
+.coverage
+.coverage.*
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.hypothesis/
+.tox/
+.nox/
+htmlcov/
+
+# Notebooks
+.ipynb_checkpoints/
+
+# IDEs and editors
+.vscode/
+.idea/
+*.code-workspace
+
+# Non-signal-processing local/tooling folders
+.agents/
+.techtile_env/
+results/tutorial_movies/
+
+
+# Docs site
+docs/
+article/
+
+# Local generated processing results
+results/acoustic_*.nc
+!results/.gitkeep
+
+# Local environment files
+.env
+.env.*
+
+# OS files
+.DS_Store
+Thumbs.db
+Desktop.ini
+
+
+# LaTeX build artifacts
+*.aux
+*.bbl
+*.bcf
+*.blg
+*.fdb_latexmk
+*.fls
+*.idx
+*.ilg
+*.ind
+*.lof
+*.log
+*.lot
+*.out
+*.run.xml
+*.synctex.gz
+*.toc
+*.xdv
+
+# Glossaries
+*.acn
+*.acr
+*.alg
+*.glg
+*.glo
+*.gls
+*.ist
+
+# Nomenclature
+*.nlo
+*.nls
+
+# TikZ externalization
+*.dpth
+*.md5
+
+# latexmk
+*.latexmk
+
+# minted / pygments
+_minted*
+*.pyg
+
+# temporary files
+*.tmp
+*.temp
+
+# generated PDFs (optional – remove if you want PDFs tracked)
+*.pdf
+
+# editor
+*~
+*.swp
+*.swo
+.DS_Store
+
+# VSCode
+.vscode/
+.codex
+todo.md
+
+# TeXstudio
+*.txss
+
+# TeXworks
+*.bak
+
+# build directories
+build/
+dist/
+out/
+article/main-blx.bib
+*.part

@@ -1,0 +1,20 @@
+# Core RF signal-processing and dataset analysis dependencies
+numpy==2.4.4
+scipy==1.17.1
+matplotlib==3.10.9
+PyYAML==6.0.3
+xarray==2026.4.0
+h5py==3.16.0
+h5netcdf==1.8.1
+requests==2.33.1
+jupyterlab>=4.4,<5
+
+# Runtime/orchestration utilities used by server, client, and acquisition helpers
+pyzmq==27.1.0
+
+# Optional hardware/simulation dependencies.
+# Install these only on machines that need the corresponding acquisition tools.
+# uhd                 # USRP hardware support
+# nidaqmx             # NI acoustic hardware support
+# pyvisa              # Instrument/scope control
+# pyroomacoustics     # Acoustic simulation helpers

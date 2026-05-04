@@ -1,0 +1,20 @@
+{
+  "room_dim": [
+    8.57,
+    4.01,
+    2.41
+  ],
+  "chirp_f_start": 20000,
+  "chirp_f_stop": 40000,
+  "chirp_duration": 0.03,
+  "chirp_DC": 0.0,
+  "chirp_ampl": 0.075,
+  "max_val_out": 10,
+  "min_val_out": -10,
+  "max_val_in": 10,
+  "min_val_in": -10,
+  "sample_rate": 250000,
+  "plot_signals": true,
+  "get_system_info": false,
+  "method": "save_ess"
+}

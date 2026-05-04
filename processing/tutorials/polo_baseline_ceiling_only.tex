@@ -1,0 +1,401 @@
+\documentclass[11pt]{article}
+
+\usepackage[a4paper,margin=1in]{geometry}
+\usepackage{amsmath,amssymb,amsfonts,bm,mathtools}
+\usepackage{enumitem}
+\usepackage{hyperref}
+\usepackage{xcolor}
+
+\title{Ceiling-Only POLO Baseline\\\large Paper-faithful adaptation of Phase-Only Localization to the Techtile ceiling array}
+\author{Revised baseline note}
+\date{}
+
+\newcommand{\R}{\mathbb{R}}
+\newcommand{\Z}{\mathbb{Z}}
+\newcommand{\jj}{\mathrm{j}}
+\newcommand{\argmin}{\operatorname*{arg\,min}}
+\newcommand{\argmax}{\operatorname*{arg\,max}}
+\newcommand{\round}{\operatorname{round}}
+\newcommand{\tr}{\operatorname{tr}}
+\newcommand{\diag}{\operatorname{diag}}
+\newcommand{\GD}{\operatorname{GD}}
+\newcommand{\wrap}{\operatorname{wrap}_{2\pi}}
+
+\begin{document}
+\maketitle
+
+\section{What this baseline is and is not}
+
+This document defines a ceiling-only implementation of POLO, following the method of Dey et al., ``POLO: Phase-Only Localization in Uplink Distributed MIMO Systems.'' The baseline must use only the phase-calibrated ceiling RF receivers. Wall antennas are excluded from candidate generation, ML scoring, receiver selection, and evaluation.
+
+The goal is not to design a stronger challenge-specific method. The goal is to reproduce POLO as a physics-based baseline:
+\begin{enumerate}[leftmargin=*]
+    \item use differential wrapped carrier phases from a selected receiver subset to generate a compact candidate set;
+    \item evaluate the paper's compressed raw-IQ ML cost only at those candidates;
+    \item use the best candidate as the initialization of gradient descent on the same ML cost.
+\end{enumerate}
+
+The only unavoidable adaptation is geometric: the paper writes the unknown UE position as a 2D vector and assumes AP positions in the same localization plane. In the Techtile ceiling case, the ceiling receiver coordinates are 3D and the transmitter height is known. Therefore the optimization variable is still 2D, but every range is the true 3D range from a candidate point on the known-height plane to a ceiling receiver. This keeps the POLO measurement model and candidate-generation logic intact, but the paper's closed-form POLO-I hyperbola intersection is not generally valid unless the selected receivers and UE lie in the same 2D plane. For the ceiling implementation, solve the POLO-I intersection equations numerically, or use the closed form only as a sanity check in synthetic coplanar tests.
+
+\section{Ceiling-only geometry and notation}
+
+Let the set of usable receivers be the phase-calibrated ceiling array
+\begin{equation}
+    \mathcal{M}=\{1,2,\ldots,M\}.
+\end{equation}
+Receiver $m$ has known 3D coordinate
+\begin{equation}
+    \mathbf{p}_m=[x_m,y_m,z_m]^T \in \R^3.
+\end{equation}
+The transmitter height is known and denoted by $h_{\rm TX}$. The unknown horizontal position is
+\begin{equation}
+    \mathbf{u}=[u_x,u_y]^T\in\Omega\subset\R^2,
+\end{equation}
+and the corresponding 3D transmitter coordinate is
+\begin{equation}
+    \mathbf{x}(\mathbf{u})=[u_x,u_y,h_{\rm TX}]^T.
+\end{equation}
+The range from receiver $m$ to candidate $\mathbf{u}$ is
+\begin{equation}
+    d_m(\mathbf{u})=\|\mathbf{p}_m-\mathbf{x}(\mathbf{u})\|_2.
+\end{equation}
+The wavelength is
+\begin{equation}
+    \lambda=\frac{c}{f_c}.
+\end{equation}
+
+\section{Paper-exact uplink narrowband signal model}
+
+For one single-carrier snapshot, the received complex baseband sample at ceiling receiver $m$ is modeled as
+\begin{equation}
+    y_m = \sqrt{P}\rho_m
+    e^{-\jj \frac{2\pi}{\lambda}d_m(\mathbf{u})}
+    e^{-\jj\varphi}s + w_m,
+    \label{eq:signal_model}
+\end{equation}
+where $P$ is transmit power, $s$ is the known unit-modulus pilot, $\rho_m\ge 0$ is the unknown channel amplitude, $\varphi$ is the unknown common UE phase offset relative to the ceiling receiver network, and $w_m$ is complex noise.
+
+The wrapped carrier phase is
+\begin{equation}
+    r_m = \angle y_m
+    = -\frac{2\pi}{\lambda}d_m(\mathbf{u}) - \varphi + 2\pi z_m+n_m,
+    \qquad z_m\in\Z.
+    \label{eq:phase_model}
+\end{equation}
+This is the key POLO ambiguity: each phase is known only modulo $2\pi$.
+
+\section{The ML cost used for final POLO scoring}
+\label{sec:ml_cost}
+
+POLO does \emph{not} score candidates using an arbitrary coherence metric. It evaluates the same compressed ML cost as the paper. Starting from
+\begin{equation}
+    \{\hat{\bm\rho},\hat\varphi,\hat{\mathbf{u}}\}
+    =\argmin_{\bm\rho,\varphi,\mathbf{u}} C(\bm\rho,\varphi,\mathbf{u}),
+\end{equation}
+with
+\begin{equation}
+    C(\bm\rho,\varphi,\mathbf{u})
+    =\sum_{m=1}^{M}\left|
+    y_m-\sqrt{P}\rho_m e^{-\jj\frac{2\pi}{\lambda}d_m(\mathbf{u})}e^{-\jj\varphi}s
+    \right|^2,
+    \label{eq:full_cost}
+\end{equation}
+the nuisance parameters $\rho_m$ and $\varphi$ are compressed away. For a candidate $\mathbf{u}$,
+\begin{equation}
+    \hat\varphi(\mathbf{u})
+    =-\frac{1}{2}\angle\left(
+    \sum_{m=1}^{M}(y_m^*)^2
+    e^{-\jj\frac{4\pi}{\lambda}d_m(\mathbf{u})}s
+    \right).
+    \label{eq:phi_hat}
+\end{equation}
+Dropping constants, the final position-only ML cost is
+\begin{equation}
+    C(\mathbf{u})
+    =-\Re\left\{
+    e^{\jj 2\hat\varphi(\mathbf{u})}
+    \sum_{m=1}^{M}(y_m^*)^2
+    e^{-\jj\frac{4\pi}{\lambda}d_m(\mathbf{u})}s
+    \right\}.
+    \label{eq:compressed_cost}
+\end{equation}
+The paper then selects
+\begin{equation}
+    \hat{\mathbf{u}}^{(0)} = \argmin_{\mathbf{u}\in\mathcal{U}} C(\mathbf{u})
+    \label{eq:candidate_ml_selection}
+\end{equation}
+from the POLO-generated candidate set $\mathcal{U}$, and refines it by gradient descent:
+\begin{equation}
+    \hat{\mathbf{u}}=\GD\left(C(\mathbf{u}),\hat{\mathbf{u}}^{(0)}\right).
+    \label{eq:gd_refinement}
+\end{equation}
+For the ceiling baseline, all sums in \eqref{eq:phi_hat}--\eqref{eq:compressed_cost} run over calibrated ceiling receivers only.
+
+\section{POLO-I: three-receiver candidate generation}
+\label{sec:polo_i}
+
+POLO-I selects three receivers: one reference receiver $m_r$ and two secondary receivers $m_{s_1}$ and $m_{s_2}$.
+
+\subsection{Differential phase constraints}
+
+Following the paper convention, define
+\begin{equation}
+    \Delta r_{s_i}
+    =\frac{\lambda}{2\pi}\left(r_{m_r}-r_{m_{s_i}}\right),
+    \qquad i\in\{1,2\}.
+    \label{eq:polo_i_differential_phase}
+\end{equation}
+The corresponding POLO-I range-difference families are
+\begin{align}
+    \mathcal{H}_1:\quad
+    d_{m_{s_1}}(\mathbf{u})-d_{m_r}(\mathbf{u})
+    &=\Delta r_{s_1}-\tilde z_{s_1}\lambda,\label{eq:polo_i_hyp_1}\\
+    \mathcal{H}_2:\quad
+    d_{m_{s_2}}(\mathbf{u})-d_{m_r}(\mathbf{u})
+    &=\Delta r_{s_2}-\tilde z_{s_2}\lambda,\label{eq:polo_i_hyp_2}
+\end{align}
+where $\tilde z_{s_i}=z_{m_{s_i}}-z_{m_r}$ is a differential integer ambiguity.
+
+The feasible ambiguity ranges follow the paper's physical branch bound:
+\begin{equation}
+    \tilde z_{s_i}\in\mathcal{Z}_{s_i}
+    =\left\{-\left\lfloor\frac{\|\mathbf{p}_{m_r}-\mathbf{p}_{m_{s_i}}\|_2}{\lambda}\right\rceil,
+    \ldots,
+    \left\lfloor\frac{\|\mathbf{p}_{m_r}-\mathbf{p}_{m_{s_i}}\|_2}{\lambda}\right\rceil\right\}.
+    \label{eq:polo_i_integer_range}
+\end{equation}
+A tighter implementation may remove branches whose right-hand side is impossible over $\Omega$, but it should not introduce any non-POLO measurements.
+
+\subsection{Candidate set}
+
+For each integer pair $(\tilde z_{s_1},\tilde z_{s_2})\in\mathcal{Z}_{s_1}\times\mathcal{Z}_{s_2}$, solve \eqref{eq:polo_i_hyp_1}--\eqref{eq:polo_i_hyp_2}. The POLO-I candidate set is
+\begin{equation}
+    \mathcal{U}_{\rm I}
+    =\bigcup_{\tilde z_{s_1}\in\mathcal{Z}_{s_1}}
+    \bigcup_{\tilde z_{s_2}\in\mathcal{Z}_{s_2}}
+    \left\{\mathbf{u}\in\Omega:
+    \begin{array}{l}
+    d_{m_{s_1}}(\mathbf{u})-d_{m_r}(\mathbf{u})=\Delta r_{s_1}-\tilde z_{s_1}\lambda,\\
+    d_{m_{s_2}}(\mathbf{u})-d_{m_r}(\mathbf{u})=\Delta r_{s_2}-\tilde z_{s_2}\lambda
+    \end{array}
+    \right\}.
+    \label{eq:polo_i_candidate_set}
+\end{equation}
+In the paper's coplanar 2D geometry, each hyperbola pair yields at most two closed-form candidates. In the ceiling geometry, solve the two equations numerically in the bounded room domain, then keep only unique solutions inside $\Omega$ whose residual norm is below a tolerance.
+
+The expected number of hyperbola pairs is approximately
+\begin{equation}
+    N_{\rm P1}=\frac{4d_{rs_1}d_{rs_2}}{\lambda^2},
+    \qquad
+    d_{rs_i}=\|\mathbf{p}_{m_r}-\mathbf{p}_{m_{s_i}}\|_2.
+    \label{eq:polo_i_pair_count}
+\end{equation}
+The number of candidates is at most $2N_{\rm P1}$ in the paper's 2D closed-form setting.
+
+\subsection{POLO-I receiver selection}
+
+The low-complexity receiver selection in the paper is
+\begin{equation}
+    (\hat m_r,\hat m_{s_1},\hat m_{s_2})
+    =\argmin_{m_r,m_{s_1},m_{s_2}\in\mathcal{M}}
+    \|\mathbf{p}_{m_r}-\mathbf{p}_{m_{s_1}}\|_2
+    \|\mathbf{p}_{m_r}-\mathbf{p}_{m_{s_2}}\|_2,
+    \label{eq:polo_i_selection_low_complexity}
+\end{equation}
+with all indices distinct.
+
+For the PEB-induced selection, use the paper logic but compute the EFIM on the known-height plane. Define the horizontal range-gradient
+\begin{equation}
+    \mathbf{g}_m(\mathbf{u})
+    =\nabla_{\mathbf{u}} d_m(\mathbf{u})
+    =\frac{1}{d_m(\mathbf{u})}
+    \begin{bmatrix}u_x-x_m\\u_y-y_m\end{bmatrix}.
+    \label{eq:horizontal_gradient}
+\end{equation}
+For a selected triplet $\mathcal{T}=\{m_r,m_{s_1},m_{s_2}\}$, the horizontal EFIM adapted from the paper is
+\begin{equation}
+    \mathbf{J}_{\mathcal{T}}(\mathbf{u})
+    =K_c\sum_{m\in\mathcal{T}}\rho_m^2\mathbf{g}_m(\mathbf{u})
+    \left(\beta_m\mathbf{g}_m^T(\mathbf{u})-
+    \sum_{m'\in\mathcal{T}\setminus m}\rho_{m'}^2\mathbf{g}_{m'}^T(\mathbf{u})\right),
+    \label{eq:polo_i_efim}
+\end{equation}
+where
+\begin{equation}
+    K_c=\frac{8P\pi^2}{\sigma_n^2\lambda^2\sum_{m'\in\mathcal{T}}\rho_{m'}^2},
+    \qquad
+    \beta_m=\sum_{m'\in\mathcal{T}\setminus m}\rho_{m'}^2.
+\end{equation}
+Then
+\begin{equation}
+    {\rm PEB}_{\mathcal{T}}(\mathbf{u})
+    =\sqrt{\tr\left(\mathbf{J}_{\mathcal{T}}^{-1}(\mathbf{u})\right)}.
+\end{equation}
+The paper's Strategy 2 keeps nearly collinear, distance-bounded triplets and chooses the one maximizing the fraction of the area where ${\rm PEB}_{\mathcal{T}}(\mathbf{u})<\Gamma$.
+
+\section{POLO-II: four-receiver candidate generation with distinct pairs}
+\label{sec:polo_ii}
+
+The earlier version of this note used a common-reference four-receiver validation scheme. That is \emph{not} the paper's POLO-II. Paper POLO-II uses two distinct AP pairs in Step 1, then refines candidates in high-error regions by adding a third differential measurement.
+
+Select four distinct ceiling receivers, grouped into two disjoint pairs:
+\begin{equation}
+    \mathcal{Q}=\{(m_1,m_2),(m_3,m_4)\}.
+\end{equation}
+
+\subsection{Step 1: raw candidates from two distinct AP pairs}
+
+Compute
+\begin{equation}
+    \Delta r_1=\frac{\lambda}{2\pi}(r_{m_2}-r_{m_1}),
+    \qquad
+    \Delta r_2=\frac{\lambda}{2\pi}(r_{m_4}-r_{m_3}).
+    \label{eq:polo_ii_step1_dphase}
+\end{equation}
+For differential ambiguities $\tilde z_1=z_{m_1}-z_{m_2}$ and $\tilde z_2=z_{m_3}-z_{m_4}$, solve
+\begin{align}
+    d_{m_1}(\mathbf{u})-d_{m_2}(\mathbf{u})
+    &=\Delta r_1-\tilde z_1\lambda,\label{eq:polo_ii_hyp_1}\\
+    d_{m_3}(\mathbf{u})-d_{m_4}(\mathbf{u})
+    &=\Delta r_2-\tilde z_2\lambda.\label{eq:polo_ii_hyp_2}
+\end{align}
+The ambiguity ranges are bounded by the corresponding receiver-pair separations, analogous to \eqref{eq:polo_i_integer_range}. The raw candidate set is
+\begin{equation}
+    \mathcal{U}_{\rm raw}=\bigcup_{\tilde z_1\in\mathcal{Z}_1}
+    \bigcup_{\tilde z_2\in\mathcal{Z}_2}
+    \left\{\mathbf{u}\in\Omega:
+    \eqref{eq:polo_ii_hyp_1}\text{ and }\eqref{eq:polo_ii_hyp_2}\text{ hold}
+    \right\}.
+\end{equation}
+Even in the paper's 2D coplanar geometry, POLO-II has no closed-form intersection solution for the two distinct-pair hyperbolas, so numerical root finding is part of the original method.
+
+With intra-pair distances
+\begin{equation}
+    d_{p_1}=\|\mathbf{p}_{m_1}-\mathbf{p}_{m_2}\|_2,
+    \qquad
+    d_{p_2}=\|\mathbf{p}_{m_3}-\mathbf{p}_{m_4}\|_2,
+\end{equation}
+the approximate number of hyperbola pairs is
+\begin{equation}
+    N_{\rm P2}=\frac{4d_{p_1}d_{p_2}}{\lambda^2}.
+\end{equation}
+
+\subsection{Step 2: refinement using a common reference inside the selected quadruplet}
+
+POLO-II identifies high-error raw candidates and refines them using three differential measurements from the same quadruplet. Let $\mathcal{E}\subseteq\mathcal{U}_{\rm raw}$ be the set of raw candidates in high-error regions. In the paper, these regions are the degeneracy regions of the Step-1 EFIM. In implementation, define $\mathcal{E}$ by geometric masks around the pair-extension lines and the line connecting the two pairs, or use a conservative PEB threshold.
+
+For every $\hat{\mathbf{u}}\in\mathcal{E}$, choose $m_1$ as the refinement reference and compute
+\begin{equation}
+    \Delta r_{e,i}=\frac{\lambda}{2\pi}\left(r_{m_1}-r_{m_{i+1}}\right),
+    \qquad i\in\{1,2,3\}.
+\end{equation}
+Estimate the local integer branch at the raw candidate by nearest integer projection:
+\begin{equation}
+    \hat z_i(\hat{\mathbf{u}})
+    =\round\left(
+    \frac{\Delta r_{e,i}-\left[d_{m_{i+1}}(\hat{\mathbf{u}})-d_{m_1}(\hat{\mathbf{u}})\right]}{\lambda}
+    \right).
+    \label{eq:polo_ii_branch_refine}
+\end{equation}
+The refined candidate is obtained by the least-squares POLO-II Step-2 problem
+\begin{equation}
+    \mathbf{u}_{\rm ref}(\hat{\mathbf{u}})
+    =\argmin_{\mathbf{u}\in\Omega}
+    \sum_{i=1}^{3}\left(
+    d_{m_{i+1}}(\mathbf{u})-d_{m_1}(\mathbf{u})
+    -\left[\Delta r_{e,i}-\hat z_i(\hat{\mathbf{u}})\lambda\right]
+    \right)^2.
+    \label{eq:polo_ii_refine_ls}
+\end{equation}
+Replace every $\hat{\mathbf{u}}\in\mathcal{E}$ with $\mathbf{u}_{\rm ref}(\hat{\mathbf{u}})$ and leave candidates in $\mathcal{U}_{\rm raw}\setminus\mathcal{E}$ unchanged. The final POLO-II candidate set is
+\begin{equation}
+    \mathcal{U}_{\rm II}
+    =\left(\mathcal{U}_{\rm raw}\setminus\mathcal{E}\right)
+    \cup
+    \left\{\mathbf{u}_{\rm ref}(\hat{\mathbf{u}}):\hat{\mathbf{u}}\in\mathcal{E}\right\}.
+\end{equation}
+For debugging only, one may set $\mathcal{E}=\mathcal{U}_{\rm raw}$ to refine all raw candidates. If reported, label this as an all-refined implementation, not the exact runtime profile of the paper.
+
+\subsection{POLO-II receiver selection}
+
+The paper's POLO-II selection chooses two close intra-pairs that are far from each other. Enumerate all disjoint pairings $\{(i_1,i_2),(i_3,i_4)\}$ and compute
+\begin{equation}
+    d_{\rm intra}^{((i_1,i_2),(i_3,i_4))}
+    =\frac{\|\mathbf{p}_{i_1}-\mathbf{p}_{i_2}\|_2+
+    \|\mathbf{p}_{i_3}-\mathbf{p}_{i_4}\|_2}{2}.
+\end{equation}
+Keep only pairings with $d_{\rm intra}<\gamma$. Then compute the horizontal distance between pair midpoints,
+\begin{equation}
+    d_{\rm inter}^{((i_1,i_2),(i_3,i_4))}
+    =\left\|
+    \frac{\mathbf{p}^{xy}_{i_1}+\mathbf{p}^{xy}_{i_2}}{2}
+    -
+    \frac{\mathbf{p}^{xy}_{i_3}+\mathbf{p}^{xy}_{i_4}}{2}
+    \right\|_2,
+\end{equation}
+where $\mathbf{p}^{xy}_i=[x_i,y_i]^T$. Select
+\begin{equation}
+    \{(\hat i_1,\hat i_2),(\hat i_3,\hat i_4)\}
+    =\argmax_{\{(i_1,i_2),(i_3,i_4)\}: d_{\rm intra}<\gamma}
+    d_{\rm inter}^{((i_1,i_2),(i_3,i_4))}.
+\end{equation}
+This preserves the paper's design principle: keep the number of hyperbola branches low through short intra-pair distances, while improving coverage through large inter-pair separation.
+
+\section{Complete ceiling-only POLO baseline}
+
+\subsection*{POLO-I baseline}
+\begin{enumerate}[leftmargin=*]
+    \item Input calibrated ceiling IQ vector $\mathbf{y}=[y_1,\ldots,y_M]^T$, ceiling receiver coordinates $\{\mathbf{p}_m\}_{m=1}^M$, wavelength $\lambda$, known transmitter height $h_{\rm TX}$, and room domain $\Omega$.
+    \item Compute phases $r_m=\angle y_m$.
+    \item Select a triplet $(m_r,m_{s_1},m_{s_2})$ using \eqref{eq:polo_i_selection_low_complexity} or the paper's PEB-induced selection.
+    \item Generate $\mathcal{U}_{\rm I}$ using \eqref{eq:polo_i_candidate_set}.
+    \item Remove duplicates and out-of-room solutions.
+    \item Evaluate the paper ML cost \eqref{eq:compressed_cost} for every candidate using all ceiling receivers.
+    \item Select $\hat{\mathbf{u}}^{(0)}$ by \eqref{eq:candidate_ml_selection}.
+    \item Refine by gradient descent as in \eqref{eq:gd_refinement}.
+\end{enumerate}
+
+\subsection*{POLO-II baseline}
+\begin{enumerate}[leftmargin=*]
+    \item Input the same ceiling-only IQ data, receiver coordinates, wavelength, known height, and room domain.
+    \item Select a quadruplet as two disjoint receiver pairs using the POLO-II selection rule above.
+    \item Generate raw candidates $\mathcal{U}_{\rm raw}$ from \eqref{eq:polo_ii_hyp_1}--\eqref{eq:polo_ii_hyp_2}.
+    \item Determine the high-error subset $\mathcal{E}$ and refine those candidates by \eqref{eq:polo_ii_refine_ls}.
+    \item Evaluate the paper ML cost \eqref{eq:compressed_cost} over $\mathcal{U}_{\rm II}$ using all ceiling receivers.
+    \item Select $\hat{\mathbf{u}}^{(0)}$ by \eqref{eq:candidate_ml_selection}.
+    \item Refine by gradient descent as in \eqref{eq:gd_refinement}.
+\end{enumerate}
+
+\section{Numerical solver requirements}
+
+For root finding in \eqref{eq:polo_i_candidate_set} and \eqref{eq:polo_ii_hyp_1}--\eqref{eq:polo_ii_hyp_2}, use a bounded nonlinear solver over $\Omega$. A robust implementation should:
+\begin{itemize}[leftmargin=*]
+    \item initialize from a coarse set of room points or from neighboring grid points;
+    \item keep only solutions with residual norm below $\epsilon_{\rm hyp}$;
+    \item discard solutions outside $\Omega$;
+    \item merge candidates closer than $\epsilon_{\rm merge}$;
+    \item evaluate the ML cost only after candidate generation, not on a dense grid except for explicit EGS benchmarking.
+\end{itemize}
+
+\section{Evaluation protocol}
+
+Report, at minimum:
+\begin{itemize}[leftmargin=*]
+    \item top-1 horizontal localization error $\|\hat{\mathbf{u}}-\mathbf{u}_{\rm true}\|_2$;
+    \item 3D localization error $\|\mathbf{x}(\hat{\mathbf{u}})-\mathbf{x}(\mathbf{u}_{\rm true})\|_2$ if all estimates are compared in 3D;
+    \item candidate-set size $|\mathcal{U}_{\rm I}|$ or $|\mathcal{U}_{\rm II}|$;
+    \item candidate coverage before ML scoring, e.g., whether $\min_{\mathbf{u}\in\mathcal{U}}\|\mathbf{u}-\mathbf{u}_{\rm true}\|_2<\tau$;
+    \item runtime and number of ML cost evaluations relative to exhaustive grid search;
+    \item failure rate, including empty candidate sets and failed numerical intersections;
+    \item results separately for POLO-I and POLO-II.
+\end{itemize}
+
+\section{Important limitations for the Techtile ceiling case}
+
+This baseline assumes a dominant LoS component, phase-calibrated ceiling receivers, and correct snapshot-level phase calibration. Multipath and residual calibration errors can create candidates that satisfy the phase geometry but are not the true transmitter position. Do not add amplitude fingerprinting, wall antennas, temporal smoothing, or learned priors to the strict POLO baseline. Those are separate methods and should be reported separately.
+
+\section{Reference}
+
+S. Dey, M. F. Keskin, D. Tagliaferri, G. Seco-Granados, M. Valkama, and H. Wymeersch, ``POLO: Phase-Only Localization in Uplink Distributed MIMO Systems,'' arXiv:2512.10879, 2025.
+
+\end{document}

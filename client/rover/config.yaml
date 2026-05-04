@@ -1,0 +1,24 @@
+serial_port: /dev/ttyUSB0
+baudrate: 115200
+
+work_area:
+  width: 1250.0
+  height: 1250.0
+  margin: 10.0
+
+feed_rate: 4000.0
+
+grid:
+  x_start: 10.0         # first column
+  y_start: 10.0         # first row
+  x_end:   1240.0         # last column
+  y_end:   1240.0         # last row
+  sweeps:        7       # total number of sweeps to generate
+  start_spacing: 120.0   # spacing (mm) used for sweep 1
+  decay:         0.75    # multiply spacing by this every odd sweep (>=3)
+  min_spacing:   50.0    # floor for spacing
+  start_sweep:   1       # resume from this sweep number (default 1)
+
+cycle_positions: true
+home_after_move: false
+verbose: false
