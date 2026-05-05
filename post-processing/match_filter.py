@@ -288,7 +288,7 @@ def plot_image(
     ax.set_xlim(float(grid_x.min()), float(grid_x.max()))
     ax.set_ylim(float(grid_y.min()), float(grid_y.max()))
     ax.legend(loc="upper left", bbox_to_anchor=(1.02, 1.0), borderaxespad=0.0)
-    fig.colorbar(im, ax=ax, label="|matched-filter image|", fraction=0.046, pad=0.04)
+    fig.colorbar(im, ax=ax, label="|matched-filter image|", fraction=0.02, pad=0.04)
     plt.show()
 
 

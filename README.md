@@ -16,7 +16,6 @@ The RF code is in the [`post-processing/match_filter.py`](post-processing/match_
 
 
 Key code paths remain in:
-
 - `server/` for orchestration and control-plane logic
 - `client/` for rover, RF, and auxiliary clients
 - `acoustic/` for acoustic capture and processing
