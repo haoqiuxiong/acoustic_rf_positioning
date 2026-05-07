@@ -105,7 +105,7 @@ def channel_for_point(
     dz = float(tx_z_m) - antenna_xyz[:, 2]
     distance = np.sqrt(dx**2 + dy**2 + dz**2)
     distance = np.maximum(distance, 1e-6)
-    amplitude = 1.0 / np.power(distance, float(path_loss_exponent))
+    amplitude = 1.0 #/ np.power(distance, float(path_loss_exponent))
     return amplitude * np.exp(-1j * k * distance)
 
 
@@ -125,12 +125,14 @@ def channel_image_map(
     k = 2.0 * np.pi / wavelength
 
     dx = grid_x[..., None] - antenna_xyz[:, 0][None, None, :]
-    #rint(f"dx shape: {dx.shape}")
+    # print antenna_xyz[:, 0]
+    #print(f"antenna_xyz[:, 0]: {antenna_xyz[:, 0]}")
+    #print(f"antenna_xyz[:, 0] shape: {antenna_xyz[:, 0].shape}")
     dy = grid_y[..., None] - antenna_xyz[:, 1][None, None, :]
     dz = float(tx_z_m) - antenna_xyz[:, 2][None, None, :]
     #print(f"dx shape: {dx.shape} | dy shape: {dy.shape} | dz shape: {dz.shape}")
     distance = np.sqrt(dx**2 + dy**2 + dz**2)
-    print(f"distance shape: {distance.shape}")
+    #print(f"distance shape: {distance.shape}")
     distance = np.maximum(distance, 1e-6)
     amplitude = 1.0 #/ np.power(distance, float(path_loss_exponent))
     return amplitude * np.exp(-1j * k * distance) # change here                       ############
@@ -157,7 +159,9 @@ def matched_filter_image(
     )
     # y=y*pilot_coefficients element-wise multiplication to apply pilot coefficients to measurements
     y = y * pilot_coefficients
-    return np.sum(np.conjugate(image_map) * y[None, None, :], axis=2)
+    MF = np.sum(np.conjugate(image_map) * y[None, None, :], axis=2)
+    MF = MF ** 2.0
+    return MF
 
 def pilot_estimation(
     y: np.ndarray,
@@ -182,11 +186,9 @@ def pilot_estimation(
     amplitude = 1.0 #/ np.power(distance, float(path_loss_exponent))
     h = amplitude * np.exp(-1j * k * distance)
     pilot_coeff = np.divide(h, y)
-    # normalize 
+    # normalize pilot coefficients to have unit magnitude
     pilot_coeff = pilot_coeff / np.abs(pilot_coeff)
     return pilot_coeff
-
-
 
 def estimate_xy_from_image(
     grid_x: np.ndarray,
@@ -203,7 +205,6 @@ def estimate_xy_from_image(
         complex(image[iy, ix]),
         float(magnitude[iy, ix]),
     )
-
 
 def simulate_channel(
     tx_x_m: float,
@@ -332,7 +333,6 @@ def plot_image(
 
 def main() -> int:
     args = parse_args()
-
     try:
         csi = load_csi_utils()
 
@@ -342,7 +342,10 @@ def main() -> int:
             dataset_path=args.dataset_path,
         )
 
-        try: 
+        try:
+            error_meas = []
+            printresults= 0
+            plotimg = 0
             # Get available cycles
             available_cycles = csi.available_cycle_ids(ds, args.experiment_id)
             #print(f"Available cycles for experiment {args.experiment_id}: {available_cycles.astype(int).tolist()}")
@@ -386,14 +389,17 @@ def main() -> int:
 
             wavelength_m = C0 / float(args.frequency_hz)
             print(f"Loaded dataset: {dataset_path}")
-            print(f"Experiment: {args.experiment_id} | Cycle: {int(args.cycle_id)}")
+            print(f"PILOT Experiment: {args.experiment_id} | Cycle: {int(args.cycle_id)}")
             print(f"Frequency: {args.frequency_hz / 1e6:.1f} MHz | Wavelength: {wavelength_m * 100:.2f} cm")
             print(f"TX height: {tx_height_m:.3f} m | Path-loss exponent: {float(args.path_loss_exponent):.2f}")
             print(f"Hosts used: {y.size} | Grid size: {grid_x.size} pixels\n")
 
+            # check number of measurements in antenna_x for all cycles to confirm that cycle 1 has enough measurements for pilot estimation
+            #for cycle in available_cycles.astype(int).tolist():
+            #    num_measurements_ant_x = csi.cycle_position(ds, args.experiment_id, cycle)['csi_host_count']
+            #    print(f"Number of measurements in cycle {cycle}: {num_measurements_ant_x}")
             # --- MEASUREMENT ---
             true_xy_pilot = (float(selected_position["rover_x"]), float(selected_position["rover_y"]))
-            
             print("Processing pilot measurement and collect pilot coefficients...")
             pilot_coefficients = pilot_estimation( 
                 y, 
@@ -407,48 +413,73 @@ def main() -> int:
             #print(f"Pilot coefficients: {pilot_coefficients}")
 
             print("Processing real measurement...")
-            args.cycle_id = int(528) # real measurement cycle
-            antenna_xyz, y = extract_measurement(
-                ds,
-                csi,
-                args.experiment_id,
-                int(args.cycle_id),
-                antenna_positions,
-            )
+            # create loop for all cycle ids in available_cycles to process each measurement cycle and plot results, for now just process cycle 100
+            for cycle in range(1,10): # available_cycles.astype(int).tolist():
+                num_measurements_ant_x = csi.cycle_position(ds, args.experiment_id, cycle)['csi_host_count']
+                if num_measurements_ant_x < 42: # skip cycles with too few measurements for localization
+                    print(f"Skipping cycle {cycle} with only {num_measurements_ant_x} measurements.")
+                    continue
+                print(f"\nProcessing cycle {cycle}...")
+                args.cycle_id = int(cycle) # real measurement cycle
+                antenna_xyz, y = extract_measurement(
+                    ds,
+                    csi,
+                    args.experiment_id,
+                    int(args.cycle_id),
+                    antenna_positions,
+                )
+                
+                image_meas = matched_filter_image(
+                    y,
+                    antenna_xyz,
+                    grid_x,
+                    grid_y,
+                    pilot_coefficients,
+                    tx_z_m=tx_height_m,
+                    frequency_hz=float(args.frequency_hz),
+                    path_loss_exponent=float(args.path_loss_exponent),
+                )
+                tx_x_meas, tx_y_meas, _, peak_mag_meas = estimate_xy_from_image(grid_x, grid_y, image_meas)
+
+                true_xy = None 
+                if selected_position["position_available"] and selected_position["rover_x"] is not None:
+                    true_xy = (float(selected_position["rover_x"]), float(selected_position["rover_y"]))
+                    error_inst = np.sqrt((tx_x_meas - true_xy[0]) ** 2 + (tx_y_meas - true_xy[1]) ** 2)
+                    # append error to list for all cycles
+                    error_meas.append(error_inst)
+                    if printresults==1:
+                        print(f"Estimated XY: ({tx_x_meas:.3f}, {tx_y_meas:.3f}) m")
+                        print(f"True XY:      ({true_xy[0]:.3f}, {true_xy[1]:.3f}) m")
+                    print(f"XY error:     {error_inst:.3f} m")
+                else:
+                    print(f"Estimated XY: ({tx_x_meas:.3f}, {tx_y_meas:.3f}) m")
+            print(f"Error measurements: {error_meas}")
+            print(f"\nAverage XY error over {len(error_meas)} cycles: {np.mean(error_meas):.3f} m")
+
+            #plot empirical CDF of error measurements
+            #if printresults==1:
+            sorted_errors = np.sort(error_meas)
+            cdf = np.arange(1, len(sorted_errors) + 1) / len(sorted_errors)
+            plt.figure(figsize=(8, 6))
+            plt.plot(sorted_errors, cdf, marker='o', linestyle='-', color='blue')
+            plt.xlabel('Localization Error (m)')
+            plt.ylabel('Empirical CDF')
+            plt.title(f'Empirical CDF of Localization Error over {len(error_meas)} Cycles')
+            plt.grid()
+            plt.show()
             
-            image_meas = matched_filter_image(
-                y,
-                antenna_xyz,
-                grid_x,
-                grid_y,
-                pilot_coefficients,
-                tx_z_m=tx_height_m,
-                frequency_hz=float(args.frequency_hz),
-                path_loss_exponent=float(args.path_loss_exponent),
-            )
-            tx_x_meas, tx_y_meas, _, peak_mag_meas = estimate_xy_from_image(grid_x, grid_y, image_meas)
-
-            true_xy = None 
-            if selected_position["position_available"] and selected_position["rover_x"] is not None:
-                true_xy = (float(selected_position["rover_x"]), float(selected_position["rover_y"]))
-                error_meas = np.hypot(tx_x_meas - true_xy[0], tx_y_meas - true_xy[1])
-                print(f"Estimated XY: ({tx_x_meas:.3f}, {tx_y_meas:.3f}) m")
-                print(f"True XY:      ({true_xy[0]:.3f}, {true_xy[1]:.3f}) m")
-                print(f"XY error:     {error_meas:.3f} m")
-            else:
-                print(f"Estimated XY: ({tx_x_meas:.3f}, {tx_y_meas:.3f}) m")
-
-            plot_image(
-                grid_x,
-                grid_y,
-                image_meas,
-                antenna_xyz,
-                tx_x_meas,
-                tx_y_meas,
-                f"Real measurement | {args.experiment_id} cycle {int(args.cycle_id)}",
-                true_xy_m=true_xy,
-                xy_error_m=float(np.hypot(tx_x_meas - true_xy[0], tx_y_meas - true_xy[1])) if true_xy else None,
-            )
+            if plotimg==1:
+                plot_image(
+                    grid_x,
+                    grid_y,
+                    image_meas,
+                    antenna_xyz,
+                    tx_x_meas,
+                    tx_y_meas,
+                    f"Real measurement | {args.experiment_id} cycle {int(args.cycle_id)}",
+                    true_xy_m=true_xy,
+                    xy_error_m=float(np.sqrt((tx_x_meas - true_xy[0]) ** 2 + (tx_y_meas - true_xy[1]) ** 2)) if true_xy else None,
+                )
 
             
 
